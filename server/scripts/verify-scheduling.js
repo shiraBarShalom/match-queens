@@ -1,0 +1,776 @@
+/* eslint-disable no-console */
+// ============================================================================
+// Manual verification for the Part 1 scheduling state machine.
+// ============================================================================
+// The project has no test runner, so this is a plain Node script. It:
+//   1. creates isolated test data (emails prefixed "schedtest.")
+//   2. drives services/schedulingService.js directly (no HTTP) through every
+//      scenario listed in the Part 1 spec
+//   3. asserts the resulting DB state
+//   4. deletes its test data (FK-safe order), at start and end
+//
+// Run:  node scripts/verify-scheduling.js
+// Exit: 0 = all passed, 1 = at least one failure.
+// It only touches rows it created; existing data is left alone.
+// ============================================================================
+
+const prisma = require("../prismaClient");
+const sched = require("../services/schedulingService");
+
+let passed = 0;
+let failed = 0;
+
+function ok(name) {
+  passed++;
+  console.log(`  ✓ ${name}`);
+}
+function bad(name, detail) {
+  failed++;
+  console.log(`  ✗ ${name}\n      ${detail}`);
+}
+
+function assert(name, cond, detail = "") {
+  cond ? ok(name) : bad(name, detail || "assertion false");
+}
+
+// Assert that the call rejects (or throws synchronously) with `status`.
+// Accepts a thunk `() => promise` OR a bare promise; a thunk also catches
+// synchronous throws (e.g. slot-payload validation in proposeSlots).
+async function expectStatus(name, fnOrPromise, status) {
+  try {
+    await (typeof fnOrPromise === "function" ? fnOrPromise() : fnOrPromise);
+    bad(name, `expected ${status}, but the call resolved`);
+  } catch (e) {
+    if (e && e.status === status) ok(name);
+    else bad(name, `expected status ${status}, got ${e && e.status} (${e && e.message})`);
+  }
+}
+
+const HOUR = 3600 * 1000;
+const DAY = 24 * HOUR;
+
+// Every default (no explicit `base`) call gets its OWN future day window, so
+// meetings created by one section never overlap slots proposed by another. This
+// matters now that proposeSlots enforces mentor double-booking — sections that
+// leave a live SCHEDULED meeting (e.g. [1], [5]) must not collide with a later
+// section's proposal. Passing an explicit `base` opts out (used by the tests
+// that deliberately construct specific / past / overlapping windows).
+let __slotWindow = 0;
+const futureSlots = (n, base) => {
+  // Default windows start well past the explicit +48h / +72h bases used by a few
+  // tests, so a staggered window never coincides with those.
+  const b = base === undefined ? Date.now() + (10 + ++__slotWindow) * DAY : base;
+  return Array.from({ length: n }, (_, i) => ({
+    startTime: new Date(b + i * HOUR).toISOString(),
+    endTime: new Date(b + i * HOUR + 30 * 60 * 1000).toISOString(),
+  }));
+};
+
+async function cleanup() {
+  const users = await prisma.user.findMany({
+    where: { email: { startsWith: "schedtest." } },
+    select: { id: true },
+  });
+  const userIds = users.map((u) => u.id);
+  if (userIds.length === 0) return;
+  const profiles = await prisma.mentorProfile.findMany({
+    where: { userId: { in: userIds } },
+    select: { id: true },
+  });
+  const profileIds = profiles.map((p) => p.id);
+  const requests = await prisma.mentoringRequest.findMany({
+    where: { OR: [{ menteeId: { in: userIds } }, { mentorProfileId: { in: profileIds } }] },
+    select: { id: true },
+  });
+  const requestIds = requests.map((r) => r.id);
+  const rounds = await prisma.schedulingRound.findMany({
+    where: { requestId: { in: requestIds } },
+    select: { id: true },
+  });
+  const roundIds = rounds.map((r) => r.id);
+
+  // FK-safe delete order (all relations are onDelete: RESTRICT).
+  await prisma.notification.deleteMany({
+    where: {
+      OR: [{ recipientId: { in: userIds } }, { requestId: { in: requestIds } }],
+    },
+  });
+  await prisma.meeting.deleteMany({ where: { requestId: { in: requestIds } } });
+  await prisma.offeredSlot.deleteMany({ where: { schedulingRoundId: { in: roundIds } } });
+  await prisma.schedulingRound.deleteMany({ where: { requestId: { in: requestIds } } });
+  await prisma.mentoringRequest.deleteMany({ where: { id: { in: requestIds } } });
+  await prisma.mentorProfile.deleteMany({ where: { id: { in: profileIds } } });
+  await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+}
+
+async function main() {
+  await cleanup();
+
+  // --- fixtures -------------------------------------------------------------
+  const mentorUser = await prisma.user.create({
+    data: { email: "schedtest.mentor@verify.local", passwordHash: "x", fullName: "Test Mentor" },
+  });
+  const mentor2User = await prisma.user.create({
+    data: { email: "schedtest.mentor2@verify.local", passwordHash: "x", fullName: "Other Mentor" },
+  });
+  const menteeUser = await prisma.user.create({
+    data: { email: "schedtest.mentee@verify.local", passwordHash: "x", fullName: "Test Mentee" },
+  });
+  const mentee2User = await prisma.user.create({
+    data: { email: "schedtest.mentee2@verify.local", passwordHash: "x", fullName: "Other Mentee" },
+  });
+  const mentorProfile = await prisma.mentorProfile.create({
+    data: { userId: mentorUser.id, background: "bg", meetingCapacity: 10, meetingDurationMinutes: 30 },
+  });
+  const mentor2Profile = await prisma.mentorProfile.create({
+    data: { userId: mentor2User.id, background: "bg", meetingCapacity: 10, meetingDurationMinutes: 30 },
+  });
+
+  const MENTOR = mentorUser.id;
+  const MENTOR2 = mentor2User.id;
+  const MENTEE = menteeUser.id;
+  const MENTEE2 = mentee2User.id;
+
+  const newRequest = () =>
+    prisma.mentoringRequest.create({
+      data: { menteeId: MENTEE, mentorProfileId: mentorProfile.id, status: "WAITING_FOR_MENTOR_SLOTS" },
+    });
+  const statusOf = async (id) =>
+    (await prisma.mentoringRequest.findUnique({ where: { id }, select: { status: true } })).status;
+  const retryOf = async (id) =>
+    (await prisma.mentoringRequest.findUnique({ where: { id }, select: { retryCount: true } })).retryCount;
+  const meetingCount = (id) => prisma.meeting.count({ where: { requestId: id } });
+
+  // === 1. Happy path: propose -> select ===================================
+  console.log("\n[1] Happy path");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    assert("propose -> WAITING_FOR_MENTEE_SELECTION", (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+    const round = await prisma.schedulingRound.findFirst({
+      where: { requestId: r.id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true },
+    });
+    assert("round 1 is INITIAL with 2 slots", round.roundNumber === 1 && round.type === "INITIAL" && round.offeredSlots.length === 2);
+    await sched.selectSlot(r.id, MENTEE, round.offeredSlots[0].id);
+    assert("select -> MATCHED", (await statusOf(r.id)) === "MATCHED");
+    const meetings = await prisma.meeting.findMany({ where: { requestId: r.id } });
+    assert("exactly one Meeting, one selected slot", meetings.length === 1 && meetings[0].selectedSlotId === round.offeredSlots[0].id && meetings[0].status === "SCHEDULED");
+  }
+
+  // === 2. Illegal transition from wrong status ============================
+  console.log("\n[2] Wrong-status transitions");
+  {
+    const r = await newRequest(); // WAITING_FOR_MENTOR_SLOTS
+    await expectStatus("select on WAITING_FOR_MENTOR_SLOTS -> 409", sched.selectSlot(r.id, MENTEE, 999999), 409);
+    await expectStatus("cannot-attend on WAITING_FOR_MENTOR_SLOTS -> 409", sched.cannotAttend(r.id, MENTEE), 409);
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    await expectStatus("propose again on WAITING_FOR_MENTEE_SELECTION -> 409", sched.proposeSlots(r.id, MENTOR, futureSlots(2)), 409);
+  }
+
+  // === 3. Wrong mentor ===================================================
+  console.log("\n[3] Wrong actor - mentor");
+  {
+    const r = await newRequest();
+    await expectStatus("other mentor proposes -> 403", sched.proposeSlots(r.id, MENTOR2, futureSlots(2)), 403);
+    await expectStatus("mentee proposes -> 403", sched.proposeSlots(r.id, MENTEE, futureSlots(2)), 403);
+  }
+
+  // === 4. Wrong mentee ==================================================
+  console.log("\n[4] Wrong actor - mentee");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    const round = await prisma.schedulingRound.findFirst({ where: { requestId: r.id }, include: { offeredSlots: true } });
+    await expectStatus("other mentee selects -> 403", sched.selectSlot(r.id, MENTEE2, round.offeredSlots[0].id), 403);
+    await expectStatus("other mentee cannot-attend -> 403", sched.cannotAttend(r.id, MENTEE2), 403);
+    await expectStatus("other mentee withdraws -> 403", sched.withdraw(r.id, MENTEE2), 403);
+    await expectStatus("mentor selects (mentee action) -> 403", sched.selectSlot(r.id, MENTOR, round.offeredSlots[0].id), 403);
+  }
+
+  // === 5. Duplicate action ============================================
+  console.log("\n[5] Duplicate action");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    await expectStatus("second propose -> 409", sched.proposeSlots(r.id, MENTOR, futureSlots(2)), 409);
+    const round = await prisma.schedulingRound.findFirst({ where: { requestId: r.id }, include: { offeredSlots: true } });
+    await sched.selectSlot(r.id, MENTEE, round.offeredSlots[0].id);
+    await expectStatus("second select -> 409", sched.selectSlot(r.id, MENTEE, round.offeredSlots[1].id), 409);
+    assert("still exactly one Meeting after 2nd select attempt", (await meetingCount(r.id)) === 1);
+  }
+
+  // === 6. CANNOT_ATTEND 0->1->2->CANCELLED ============================
+  console.log("\n[6] Retry ladder");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    await sched.cannotAttend(r.id, MENTEE);
+    assert("retry 0->1, back to WAITING_FOR_MENTOR_SLOTS", (await retryOf(r.id)) === 1 && (await statusOf(r.id)) === "WAITING_FOR_MENTOR_SLOTS");
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(3));
+    await sched.cannotAttend(r.id, MENTEE);
+    assert("retry 1->2", (await retryOf(r.id)) === 2 && (await statusOf(r.id)) === "WAITING_FOR_MENTOR_SLOTS");
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    await sched.cannotAttend(r.id, MENTEE);
+    assert("retry 2 + CANNOT_ATTEND -> CANCELLED, retryCount stays 2", (await retryOf(r.id)) === 2 && (await statusOf(r.id)) === "CANCELLED");
+  }
+
+  // === 7. Old-round slot cannot be selected (also: rollback) ===========
+  console.log("\n[7] Superseded-round slot");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2, Date.now() + 48 * HOUR));
+    const round1 = await prisma.schedulingRound.findFirst({ where: { requestId: r.id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true } });
+    await sched.cannotAttend(r.id, MENTEE);
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2, Date.now() + 72 * HOUR));
+    await expectStatus("select a round-1 slot after round 2 exists -> 409", sched.selectSlot(r.id, MENTEE, round1.offeredSlots[0].id), 409);
+    assert("status unchanged after failed select (tx rollback)", (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+    assert("no Meeting created after failed select (tx rollback)", (await meetingCount(r.id)) === 0);
+  }
+
+  // === 8. Slot from another request ==================================
+  console.log("\n[8] Cross-request slot");
+  {
+    const r1 = await newRequest();
+    const r2 = await newRequest();
+    await sched.proposeSlots(r1.id, MENTOR, futureSlots(2));
+    await sched.proposeSlots(r2.id, MENTOR, futureSlots(2));
+    const r1round = await prisma.schedulingRound.findFirst({ where: { requestId: r1.id }, include: { offeredSlots: true } });
+    await expectStatus("select r1's slot while acting on r2 -> 409", sched.selectSlot(r2.id, MENTEE, r1round.offeredSlots[0].id), 409);
+    assert("r2 still WAITING_FOR_MENTEE_SELECTION", (await statusOf(r2.id)) === "WAITING_FOR_MENTEE_SELECTION");
+  }
+
+  // === 9. Terminal MATCHED ==========================================
+  console.log("\n[9] MATCHED is terminal (except mentor CANCEL)");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    const round = await prisma.schedulingRound.findFirst({ where: { requestId: r.id }, include: { offeredSlots: true } });
+    await sched.selectSlot(r.id, MENTEE, round.offeredSlots[0].id);
+    await expectStatus("MATCHED + propose -> 409", sched.proposeSlots(r.id, MENTOR, futureSlots(2)), 409);
+    await expectStatus("MATCHED + select -> 409", sched.selectSlot(r.id, MENTEE, round.offeredSlots[1].id), 409);
+    await expectStatus("MATCHED + cannot-attend -> 409", sched.cannotAttend(r.id, MENTEE), 409);
+    await expectStatus("MATCHED + withdraw -> 409", sched.withdraw(r.id, MENTEE), 409);
+    // mentor CANCEL IS allowed from MATCHED:
+    await sched.mentorCancel(r.id, MENTOR);
+    assert("MATCHED + mentor CANCEL -> CANCELLED", (await statusOf(r.id)) === "CANCELLED");
+    const m = await prisma.meeting.findFirst({ where: { requestId: r.id } });
+    assert("Meeting.status -> CANCELLED in same transaction", m.status === "CANCELLED");
+  }
+
+  // === 10. Terminal CANCELLED / REJECTED ===========================
+  console.log("\n[10] CANCELLED / REJECTED are fully terminal");
+  {
+    const rc = await newRequest();
+    await sched.withdraw(rc.id, MENTEE);
+    assert("withdraw -> CANCELLED", (await statusOf(rc.id)) === "CANCELLED");
+    await expectStatus("CANCELLED + propose -> 409", sched.proposeSlots(rc.id, MENTOR, futureSlots(2)), 409);
+    await expectStatus("CANCELLED + cannot-attend -> 409", sched.cannotAttend(rc.id, MENTEE), 409);
+    await expectStatus("CANCELLED + mentor CANCEL -> 409", sched.mentorCancel(rc.id, MENTOR), 409);
+
+    const rr = await newRequest();
+    await sched.reject(rr.id, MENTOR);
+    assert("reject -> REJECTED", (await statusOf(rr.id)) === "REJECTED");
+    await expectStatus("REJECTED + propose -> 409", sched.proposeSlots(rr.id, MENTOR, futureSlots(2)), 409);
+    await expectStatus("REJECTED + withdraw -> 409", sched.withdraw(rr.id, MENTEE), 409);
+  }
+
+  // === 11. Mentor CANCEL from PENDING_MENTEE ======================
+  console.log("\n[11] Mentor CANCEL after proposing");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    await sched.mentorCancel(r.id, MENTOR);
+    assert("PENDING_MENTEE + mentor CANCEL -> CANCELLED", (await statusOf(r.id)) === "CANCELLED");
+    assert("no Meeting exists (never scheduled)", (await meetingCount(r.id)) === 0);
+    await expectStatus("mentee cannot CANCEL (mentor action) -> 403",
+      sched.mentorCancel((await newRequestProposed()).id, MENTEE), 403);
+  }
+  async function newRequestProposed() {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    return r;
+  }
+
+  // === 12. Slot-count rule (exactly 2-3) =========================
+  console.log("\n[12] Proposal must contain 2-3 slots");
+  {
+    const r = await newRequest();
+    await expectStatus("propose 1 slot -> 400", () => sched.proposeSlots(r.id, MENTOR, futureSlots(1)), 400);
+    await expectStatus("propose 4 slots -> 400", () => sched.proposeSlots(r.id, MENTOR, futureSlots(4)), 400);
+    assert("request untouched after bad-count proposals", (await statusOf(r.id)) === "WAITING_FOR_MENTOR_SLOTS");
+    assert("no round created after bad-count proposals", (await prisma.schedulingRound.count({ where: { requestId: r.id } })) === 0);
+  }
+
+  // === 13. Past-dated slot cannot be selected ===================
+  console.log("\n[13] Stale slot");
+  {
+    const r = await newRequest();
+    // propose valid future slots, then move DB time forward by making a slot 'past'
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2, Date.now() + 2000));
+    const round = await prisma.schedulingRound.findFirst({ where: { requestId: r.id }, include: { offeredSlots: true } });
+    await new Promise((res) => setTimeout(res, 2500)); // let the first slot's startTime pass
+    await expectStatus("select a now-past slot -> 409", sched.selectSlot(r.id, MENTEE, round.offeredSlots[0].id), 409);
+    assert("status unchanged after past-slot select (rollback)", (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+  }
+
+  // === 14. Nonexistent request / bad ids ======================
+  console.log("\n[14] Not found / invalid id");
+  {
+    await expectStatus("action on missing request -> 404", sched.proposeSlots(2147483000, MENTOR, futureSlots(2)), 404);
+    await expectStatus("non-numeric requestId -> 400", sched.withdraw("abc", MENTEE), 400);
+  }
+
+  // === 15. Concurrency: SELECT_SLOT vs CANNOT_ATTEND =============
+  console.log("\n[15] Concurrent SELECT_SLOT vs CANNOT_ATTEND");
+  {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    const round = await prisma.schedulingRound.findFirst({ where: { requestId: r.id }, include: { offeredSlots: true } });
+    const results = await Promise.allSettled([
+      sched.selectSlot(r.id, MENTEE, round.offeredSlots[0].id),
+      sched.cannotAttend(r.id, MENTEE),
+    ]);
+    const fulfilled = results.filter((x) => x.status === "fulfilled").length;
+    const rejected = results.filter((x) => x.status === "rejected");
+    assert("exactly one of the two succeeded", fulfilled === 1 && rejected.length === 1);
+    assert("the loser failed with 409", rejected[0].reason && rejected[0].reason.status === 409);
+    const st = await statusOf(r.id);
+    const rc = await retryOf(r.id);
+    const mc = await meetingCount(r.id);
+    assert(
+      "final state is internally consistent (MATCHED+1 meeting+rc0  XOR  WAITING_FOR_MENTOR_SLOTS+0 meeting+rc1)",
+      (st === "MATCHED" && mc === 1 && rc === 0) ||
+        (st === "WAITING_FOR_MENTOR_SLOTS" && mc === 0 && rc === 1),
+      `got status=${st} retryCount=${rc} meetings=${mc}`
+    );
+  }
+
+  // === 16. Concurrency: PROPOSE_SLOTS vs WITHDRAW ===============
+  console.log("\n[16] Concurrent PROPOSE_SLOTS vs WITHDRAW");
+  {
+    const r = await newRequest();
+    const results = await Promise.allSettled([
+      sched.proposeSlots(r.id, MENTOR, futureSlots(2)),
+      sched.withdraw(r.id, MENTEE),
+    ]);
+    const fulfilled = results.filter((x) => x.status === "fulfilled").length;
+    assert("exactly one of the two succeeded", fulfilled === 1);
+    const st = await statusOf(r.id);
+    const roundCount = await prisma.schedulingRound.count({ where: { requestId: r.id } });
+    assert(
+      "never CANCELLED with an active round (propose wins => PENDING_MENTEE+1 round; withdraw wins => CANCELLED+0 rounds)",
+      (st === "WAITING_FOR_MENTEE_SELECTION" && roundCount === 1) ||
+        (st === "CANCELLED" && roundCount === 0),
+      `got status=${st} rounds=${roundCount}`
+    );
+  }
+
+  // === 17. Self-request guard ================================
+  console.log("\n[17] Self-request (mentor == mentee)");
+  {
+    const selfReq = await prisma.mentoringRequest.create({
+      data: { menteeId: MENTOR, mentorProfileId: mentorProfile.id, status: "WAITING_FOR_MENTOR_SLOTS" },
+    });
+    await expectStatus("any action on a self-request -> 409", sched.proposeSlots(selfReq.id, MENTOR, futureSlots(2)), 409);
+  }
+
+  // === 18. Post-match RESCHEDULE (once) + CANNOT_ATTEND_MEETING (Part 14/15) ===
+  console.log("\n[18] Reschedule limit + cannot-attend-meeting");
+
+  // Drive a request all the way to MATCHED and return { id, slotId }.
+  const toMatched = async () => {
+    const r = await newRequest();
+    await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+    const round = await prisma.schedulingRound.findFirst({
+      where: { requestId: r.id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true },
+    });
+    await sched.selectSlot(r.id, MENTEE, round.offeredSlots[0].id);
+    return r.id;
+  };
+  const reschedUsed = async (id) =>
+    (await prisma.mentoringRequest.findUnique({ where: { id }, select: { rescheduleAfterMatchUsed: true } }))
+      .rescheduleAfterMatchUsed;
+
+  // 18a0 — direct cancel before any reschedule (mentee)
+  {
+    const id = await toMatched();
+    assert("flag starts false", (await reschedUsed(id)) === false);
+    const REASON = "Perfectly valid reason text here for a direct cancel.";
+    await sched.cannotAttendMeeting(id, MENTEE, REASON);
+    assert("direct cancel -> request CANCELLED", (await statusOf(id)) === "CANCELLED");
+    assert("direct cancel does not spend reschedule flag", (await reschedUsed(id)) === false);
+    const active = await prisma.meeting.findFirst({ where: { requestId: id }, orderBy: { attemptNumber: "desc" } });
+    assert("direct cancel stamps meeting CANCELLED",
+      active.status === "CANCELLED" &&
+      active.cancelledByUserId === MENTEE &&
+      active.cancellationReason === REASON);
+    const notif = await prisma.notification.findFirst({
+      where: { requestId: id, type: "REQUEST_CANCELLED" }, orderBy: { createdAt: "desc" },
+    });
+    assert("mentor notified on direct mentee cancel",
+      notif && notif.recipientId === MENTOR && notif.payload.byMentor === false &&
+      notif.payload.explanation === REASON);
+  }
+
+  // 18a — reschedule once, rematch, then mentor cancel + auth/validation
+  {
+    const id = await toMatched();
+
+    await sched.reschedule(id, MENTEE);
+    assert("first RESCHEDULE -> WAITING_FOR_MENTOR_SLOTS + flag set",
+      (await statusOf(id)) === "WAITING_FOR_MENTOR_SLOTS" && (await reschedUsed(id)) === true);
+    const m1 = await prisma.meeting.findFirst({ where: { requestId: id }, orderBy: { attemptNumber: "desc" } });
+    assert("superseded meeting kept as RESCHEDULED", m1.status === "RESCHEDULED");
+
+    // mentor re-proposes, mentee re-selects -> MATCHED again (attempt 2)
+    await sched.proposeSlots(id, MENTOR, futureSlots(2));
+    const round2 = await prisma.schedulingRound.findFirst({
+      where: { requestId: id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true },
+    });
+    await sched.selectSlot(id, MENTEE, round2.offeredSlots[0].id);
+    assert("re-matched -> MATCHED, attempt 2", (await statusOf(id)) === "MATCHED" && (await meetingCount(id)) === 2);
+
+    await expectStatus("2nd RESCHEDULE -> 409", () => sched.reschedule(id, MENTEE), 409);
+    await expectStatus("cannot-attend-meeting: reason too short -> 400",
+      () => sched.cannotAttendMeeting(id, MENTOR, "nope"), 400);
+    await expectStatus("cannot-attend-meeting: reason too long -> 400",
+      () => sched.cannotAttendMeeting(id, MENTOR, "x".repeat(501)), 400);
+    await expectStatus("cannot-attend-meeting: non-participant -> 403",
+      () => sched.cannotAttendMeeting(id, MENTEE2, "A perfectly reasonable explanation."), 403);
+
+    const REASON = "I was pulled into an unavoidable on-call incident tonight, so sorry.";
+    await sched.cannotAttendMeeting(id, MENTOR, REASON);
+    assert("cannot-attend-meeting after reschedule -> request CANCELLED", (await statusOf(id)) === "CANCELLED");
+
+    const meetings = await prisma.meeting.findMany({ where: { requestId: id }, orderBy: { attemptNumber: "asc" } });
+    assert("history preserved: 2 meetings, older still RESCHEDULED",
+      meetings.length === 2 && meetings[0].status === "RESCHEDULED");
+    const active = meetings[1];
+    assert("active meeting -> CANCELLED + who/why/when stamped",
+      active.status === "CANCELLED" &&
+      active.cancelledByUserId === MENTOR &&
+      active.cancellationReason === REASON &&
+      active.cancelledAt instanceof Date);
+    const roundCount = await prisma.schedulingRound.count({ where: { requestId: id } });
+    assert("scheduling rounds preserved (2)", roundCount === 2);
+
+    const notif = await prisma.notification.findFirst({
+      where: { requestId: id, type: "REQUEST_CANCELLED" }, orderBy: { createdAt: "desc" },
+    });
+    assert("mentee notified with reason + explanation snapshot",
+      notif && notif.recipientId === MENTEE && notif.meetingId === active.id &&
+      notif.payload && notif.payload.reason === "cannotAttendMeeting" &&
+      notif.payload.byMentor === true && notif.payload.explanation === REASON);
+
+    await expectStatus("duplicate cannot-attend-meeting -> 409",
+      () => sched.cannotAttendMeeting(id, MENTOR, REASON), 409);
+  }
+
+  // 18b — mentee cannot attend after a reschedule cycle (mentor notified)
+  {
+    const id = await toMatched();
+    await sched.reschedule(id, MENTOR);
+    await sched.proposeSlots(id, MENTOR, futureSlots(2));
+    const round = await prisma.schedulingRound.findFirst({
+      where: { requestId: id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true },
+    });
+    await sched.selectSlot(id, MENTEE, round.offeredSlots[0].id);
+
+    const REASON = "A work deadline moved and I now have to be in the office that evening.";
+    await sched.cannotAttendMeeting(id, MENTEE, REASON);
+    assert("mentee direction after reschedule -> CANCELLED", (await statusOf(id)) === "CANCELLED");
+    const active = await prisma.meeting.findFirst({ where: { requestId: id }, orderBy: { attemptNumber: "desc" } });
+    assert("active meeting CANCELLED by mentee", active.status === "CANCELLED" && active.cancelledByUserId === MENTEE);
+    const notif = await prisma.notification.findFirst({
+      where: { requestId: id, type: "REQUEST_CANCELLED" }, orderBy: { createdAt: "desc" },
+    });
+    assert("mentor notified, byMentor:false, explanation carried",
+      notif && notif.recipientId === MENTOR && notif.payload.byMentor === false &&
+      notif.payload.explanation === REASON);
+  }
+
+  // 18c — concurrent duplicate CANNOT_ATTEND_MEETING on first match: exactly one wins
+  {
+    const id = await toMatched();
+    const results = await Promise.allSettled([
+      sched.cannotAttendMeeting(id, MENTOR, "Reason from the mentor side, long enough."),
+      sched.cannotAttendMeeting(id, MENTEE, "Reason from the mentee side, long enough."),
+    ]);
+    const fulfilled = results.filter((x) => x.status === "fulfilled").length;
+    assert("concurrent cannot-attend-meeting: exactly one succeeded", fulfilled === 1);
+    const cancelledMeetings = await prisma.meeting.count({
+      where: { requestId: id, status: "CANCELLED" },
+    });
+    assert("exactly one meeting ended up CANCELLED", cancelledMeetings === 1);
+  }
+
+  // === 19. Mentor double-booking protection ==========================
+  console.log("\n[19] Mentor double-booking protection");
+  {
+    // A far-future base clear of every staggered window used above.
+    const B = Date.now() + 200 * DAY;
+
+    // propose a list of [startMs, endMs) intervals for `reqId`.
+    const propose = (reqId, mentorUserId, ranges) =>
+      sched.proposeSlots(
+        reqId,
+        mentorUserId,
+        ranges.map(([s, e]) => ({
+          startTime: new Date(s).toISOString(),
+          endTime: new Date(e).toISOString(),
+        }))
+      );
+
+    // Book a SCHEDULED meeting for `mentorProfileId` at exactly [startMs, endMs).
+    // Drives the real propose -> select path (2 slots: target + a far decoy).
+    const bookMeeting = async (menteeId, mentorUserId, mentorProfileId, startMs, endMs) => {
+      const r = await prisma.mentoringRequest.create({
+        data: { menteeId, mentorProfileId, status: "WAITING_FOR_MENTOR_SLOTS" },
+      });
+      const decoy = startMs + 90 * DAY;
+      await propose(r.id, mentorUserId, [
+        [startMs, endMs],
+        [decoy, decoy + 30 * 60 * 1000],
+      ]);
+      const round = await prisma.schedulingRound.findFirst({
+        where: { requestId: r.id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true },
+      });
+      const target = round.offeredSlots.find((s) => s.startTime.getTime() === startMs);
+      await sched.selectSlot(r.id, menteeId, target.id);
+      return r.id;
+    };
+
+    // MENTOR now has a SCHEDULED meeting 10:00–11:00  ==  [B, B + 1h)
+    await bookMeeting(MENTEE, MENTOR, mentorProfile.id, B, B + HOUR);
+
+    // 1. exact same interval -> rejected, request + rounds untouched
+    {
+      const r = await newRequest();
+      await expectStatus("exact-overlap slot -> 409",
+        () => propose(r.id, MENTOR, [[B, B + HOUR], [B + 10 * DAY, B + 10 * DAY + HOUR]]), 409);
+      assert("conflict leaves request WAITING_FOR_MENTOR_SLOTS", (await statusOf(r.id)) === "WAITING_FOR_MENTOR_SLOTS");
+      assert("conflict creates no SchedulingRound (tx rollback)",
+        (await prisma.schedulingRound.count({ where: { requestId: r.id } })) === 0);
+    }
+    // 2. partial overlap (10:15–10:45 inside 10:00–11:00) -> rejected
+    {
+      const r = await newRequest();
+      await expectStatus("partial-overlap slot -> 409",
+        () => propose(r.id, MENTOR, [[B + 15 * 60000, B + 45 * 60000], [B + 10 * DAY, B + 10 * DAY + HOUR]]), 409);
+    }
+    // 3. enclosing overlap (09:30–11:30 around 10:00–11:00) -> rejected
+    {
+      const r = await newRequest();
+      await expectStatus("enclosing-overlap slot -> 409",
+        () => propose(r.id, MENTOR, [[B - 30 * 60000, B + 90 * 60000], [B + 10 * DAY, B + 10 * DAY + HOUR]]), 409);
+    }
+    // 4 + 5. boundary-touching slots (09:00–10:00 and 11:00–12:00) -> allowed
+    {
+      const r = await newRequest();
+      await propose(r.id, MENTOR, [[B - HOUR, B], [B + HOUR, B + 2 * HOUR]]);
+      assert("back-to-back (boundary-touching) slots accepted -> PENDING_MENTEE",
+        (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+      const round = await prisma.schedulingRound.findFirst({
+        where: { requestId: r.id }, orderBy: { roundNumber: "desc" }, include: { offeredSlots: true },
+      });
+      assert("both boundary slots stored", round.offeredSlots.length === 2);
+    }
+    // 6. a CANCELLED meeting does not block its interval
+    {
+      const cReq = await bookMeeting(MENTEE, MENTOR, mentorProfile.id, B + 20 * DAY, B + 20 * DAY + HOUR);
+      await sched.mentorCancel(cReq, MENTOR); // request CANCELLED + meeting CANCELLED
+      const r = await newRequest();
+      await propose(r.id, MENTOR, [[B + 20 * DAY, B + 20 * DAY + HOUR], [B + 21 * DAY, B + 21 * DAY + HOUR]]);
+      assert("slot over a CANCELLED meeting is accepted",
+        (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+    }
+    // 7. another mentor's meeting does not block this mentor
+    {
+      await bookMeeting(MENTEE2, MENTOR2, mentor2Profile.id, B + 30 * DAY, B + 30 * DAY + HOUR);
+      const r = await newRequest(); // MENTEE + mentorProfile (mentor 1)
+      await propose(r.id, MENTOR, [[B + 30 * DAY, B + 30 * DAY + HOUR], [B + 31 * DAY, B + 31 * DAY + HOUR]]);
+      assert("a different mentor's booking does not block this mentor",
+        (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+    }
+    // 8. read model: exposes the live SCHEDULED interval, never the CANCELLED one, future-only
+    {
+      const busy = await sched.getMentorBusyIntervals(mentorProfile.id);
+      assert("busy intervals include the live SCHEDULED meeting",
+        busy.some((b) => b.start.getTime() === B && b.end.getTime() === B + HOUR));
+      assert("busy intervals exclude the CANCELLED meeting",
+        !busy.some((b) => b.start.getTime() === B + 20 * DAY));
+      assert("busy intervals are future-only", busy.every((b) => b.end.getTime() > Date.now()));
+    }
+    // 9. stale tab: a slot that was free at page-load is still rejected once booked
+    {
+      const staleReq = await newRequest(); // "tab loaded here — 10:00 @ B2 was free"
+      const B2 = B + 40 * DAY;
+      await bookMeeting(MENTEE, MENTOR, mentorProfile.id, B2, B2 + HOUR); // booked meanwhile
+      await expectStatus("stale-tab submit of a now-booked slot -> 409 (re-checked at accept time)",
+        () => propose(staleReq.id, MENTOR, [[B2, B2 + HOUR], [B2 + DAY, B2 + DAY + HOUR]]), 409);
+      assert("stale-tab conflict rolled back — no round", (await prisma.schedulingRound.count({ where: { requestId: staleReq.id } })) === 0);
+    }
+  }
+
+  // === 20. Mentee counter-proposal (SUGGEST_SLOTS + APPROVE_SUGGESTED_SLOT) ===
+  console.log("\n[20] Mentee-suggested times");
+  {
+    const latestRound = (id) =>
+      prisma.schedulingRound.findFirst({
+        where: { requestId: id },
+        orderBy: { roundNumber: "desc" },
+        include: { offeredSlots: true },
+      });
+    const notifTypes = (recipientId, requestId, type) =>
+      prisma.notification.findMany({ where: { recipientId, requestId, type } });
+
+    // 20a — happy path: propose -> suggest -> approve -> exactly one Meeting
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.suggestSlots(r.id, MENTEE, futureSlots(3));
+
+      assert("suggest -> WAITING_FOR_MENTOR_SLOTS, retryCount 1",
+        (await statusOf(r.id)) === "WAITING_FOR_MENTOR_SLOTS" && (await retryOf(r.id)) === 1);
+      const sround = await latestRound(r.id);
+      assert("latest round is MENTEE-authored EXTRA_SLOTS with 3 slots",
+        sround.proposedByRole === "MENTEE" && sround.type === "EXTRA_SLOTS" && sround.offeredSlots.length === 3);
+      const mentorNotifs = await notifTypes(MENTOR, r.id, "RESCHEDULE_REQUIRED");
+      assert("mentor got RESCHEDULE_REQUIRED reason=menteeSuggested",
+        mentorNotifs.some((n) => n.payload && n.payload.reason === "menteeSuggested"));
+
+      const chosen = sround.offeredSlots[1];
+      await sched.approveSuggestedSlot(r.id, MENTOR, chosen.id);
+      assert("approve -> MATCHED", (await statusOf(r.id)) === "MATCHED");
+      const meetings = await prisma.meeting.findMany({ where: { requestId: r.id } });
+      assert("exactly one Meeting on the approved slot",
+        meetings.length === 1 && meetings[0].selectedSlotId === chosen.id && meetings[0].status === "SCHEDULED");
+      const matched = await prisma.notification.count({
+        where: { requestId: r.id, type: "MEETING_MATCHED" },
+      });
+      assert("both participants got MEETING_MATCHED", matched === 2);
+    }
+
+    // 20b — wrong actor
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await expectStatus("mentor cannot SUGGEST_SLOTS -> 403", () => sched.suggestSlots(r.id, MENTOR, futureSlots(2)), 403);
+      await expectStatus("other mentee cannot SUGGEST_SLOTS -> 403", () => sched.suggestSlots(r.id, MENTEE2, futureSlots(2)), 403);
+      await sched.suggestSlots(r.id, MENTEE, futureSlots(2));
+      const sround = await latestRound(r.id);
+      await expectStatus("mentee cannot APPROVE_SUGGESTED_SLOT -> 403",
+        sched.approveSuggestedSlot(r.id, MENTEE, sround.offeredSlots[0].id), 403);
+      await expectStatus("other mentor cannot APPROVE_SUGGESTED_SLOT -> 403",
+        sched.approveSuggestedSlot(r.id, MENTOR2, sround.offeredSlots[0].id), 403);
+    }
+
+    // 20c — payload validation
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await expectStatus("suggest 0 slots -> 400", () => sched.suggestSlots(r.id, MENTEE, []), 400);
+      await expectStatus("suggest 4 slots -> 400", () => sched.suggestSlots(r.id, MENTEE, futureSlots(4)), 400);
+      const dup = futureSlots(1)[0];
+      await expectStatus("suggest duplicate start -> 400", () => sched.suggestSlots(r.id, MENTEE, [dup, dup]), 400);
+      await expectStatus("suggest past slot -> 400", () => sched.suggestSlots(r.id, MENTEE, [
+        { startTime: new Date(Date.now() - HOUR).toISOString(), endTime: new Date(Date.now() - HOUR + 30 * 60000).toISOString() },
+      ]), 400);
+      assert("request untouched after bad suggestions",
+        (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION" && (await retryOf(r.id)) === 0);
+    }
+
+    // 20d — fallback: mentor may still PROPOSE her own set; old suggested slot then dies
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.suggestSlots(r.id, MENTEE, futureSlots(2));
+      const sround = await latestRound(r.id);
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2)); // mentor counters instead of approving
+      assert("mentor counter -> WAITING_FOR_MENTEE_SELECTION", (await statusOf(r.id)) === "WAITING_FOR_MENTEE_SELECTION");
+      await expectStatus("approve a superseded mentee slot -> 409",
+        sched.approveSuggestedSlot(r.id, MENTOR, sround.offeredSlots[0].id), 409);
+      const newRound = await latestRound(r.id);
+      await sched.selectSlot(r.id, MENTEE, newRound.offeredSlots[0].id);
+      assert("mentee can still select the mentor's countered slot -> MATCHED", (await statusOf(r.id)) === "MATCHED");
+    }
+
+    // 20e — approve is not valid on an ordinary mentor-owed round
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.cannotAttend(r.id, MENTEE); // WAITING_FOR_MENTOR_SLOTS, mentor-owed (no mentee round)
+      const round1 = await latestRound(r.id);
+      await expectStatus("approve on a mentor-owed round -> 409",
+        sched.approveSuggestedSlot(r.id, MENTOR, round1.offeredSlots[0].id), 409);
+    }
+
+    // 20f — concurrency: two approvals of different slots, exactly one Meeting
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.suggestSlots(r.id, MENTEE, futureSlots(3));
+      const sround = await latestRound(r.id);
+      const results = await Promise.allSettled([
+        sched.approveSuggestedSlot(r.id, MENTOR, sround.offeredSlots[0].id),
+        sched.approveSuggestedSlot(r.id, MENTOR, sround.offeredSlots[1].id),
+      ]);
+      const fulfilled = results.filter((x) => x.status === "fulfilled").length;
+      assert("exactly one approval succeeded", fulfilled === 1);
+      assert("exactly one Meeting created", (await meetingCount(r.id)) === 1);
+      assert("request MATCHED", (await statusOf(r.id)) === "MATCHED");
+    }
+
+    // 20g — retry cap: SUGGEST_SLOTS has no row once retryCount === 2
+    {
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.suggestSlots(r.id, MENTEE, futureSlots(2));       // rc 0 -> 1
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.cannotAttend(r.id, MENTEE);                       // rc 1 -> 2
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      assert("retryCount is at the cap", (await retryOf(r.id)) === 2);
+      await expectStatus("SUGGEST_SLOTS at the retry cap -> 409", () => sched.suggestSlots(r.id, MENTEE, futureSlots(2)), 409);
+      await sched.cannotAttend(r.id, MENTEE);
+      assert("CANNOT_ATTEND at the cap still closes the request", (await statusOf(r.id)) === "CANCELLED");
+    }
+
+    // 20h — mentor double-booking blocks approving an overlapping suggested slot
+    {
+      const B = Date.now() + 300 * DAY;
+      const booked = await prisma.mentoringRequest.create({
+        data: { menteeId: MENTEE2, mentorProfileId: mentorProfile.id, status: "WAITING_FOR_MENTOR_SLOTS" },
+      });
+      await sched.proposeSlots(booked.id, MENTOR, [
+        { startTime: new Date(B).toISOString(), endTime: new Date(B + HOUR).toISOString() },
+        { startTime: new Date(B + 5 * DAY).toISOString(), endTime: new Date(B + 5 * DAY + HOUR).toISOString() },
+      ]);
+      const bround = await latestRound(booked.id);
+      await sched.selectSlot(booked.id, MENTEE2, bround.offeredSlots.find((x) => x.startTime.getTime() === B).id);
+
+      const r = await newRequest();
+      await sched.proposeSlots(r.id, MENTOR, futureSlots(2));
+      await sched.suggestSlots(r.id, MENTEE, [
+        { startTime: new Date(B + 15 * 60000).toISOString(), endTime: new Date(B + 45 * 60000).toISOString() }, // overlaps
+      ]);
+      const sround = await latestRound(r.id);
+      await expectStatus("approve a slot overlapping the mentor's meeting -> 409",
+        sched.approveSuggestedSlot(r.id, MENTOR, sround.offeredSlots[0].id), 409);
+      assert("request stays WAITING_FOR_MENTOR_SLOTS after blocked approval",
+        (await statusOf(r.id)) === "WAITING_FOR_MENTOR_SLOTS" && (await meetingCount(r.id)) === 0);
+    }
+  }
+
+  console.log(`\n${"=".repeat(50)}\n  PASSED: ${passed}    FAILED: ${failed}\n${"=".repeat(50)}`);
+}
+
+main()
+  .catch((e) => {
+    console.error("\nSCRIPT ERROR:", e);
+    failed++;
+  })
+  .finally(async () => {
+    await cleanup();
+    await prisma.$disconnect();
+    process.exit(failed === 0 ? 0 : 1);
+  });
