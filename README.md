@@ -1,4 +1,4 @@
-**# Match Queens
+# Match Queens
 
 A full-stack mentoring platform developed as part of the **QueenB × AppsFlyer Software Engineering Bootcamp** (August–September 2026).
 
@@ -36,4 +36,4 @@ Setup instructions will be finalized after the local project source and configur
 ## Background
 
 Built collaboratively during the QueenB × AppsFlyer Software Engineering Bootcamp. This repository is a personal portfolio copy, not the original shared team repository.
-**
+
